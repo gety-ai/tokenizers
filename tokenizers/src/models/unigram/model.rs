@@ -161,8 +161,8 @@ impl Unigram {
     }
 
     #[cfg(test)]
-    fn force_legacy_trie_for_tests(&mut self) {
-        let trie = Trie::build_legacy_for_tests(
+    fn force_fallback_trie_for_tests(&mut self) {
+        let trie = Trie::build_fallback_for_tests(
             self.vocab
                 .iter()
                 .enumerate()
@@ -711,27 +711,33 @@ mod tests {
     }
 
     #[test]
-    fn yada_matches_legacy_on_real_tokenizer() {
+    fn yada_matches_fallback_on_real_tokenizer() {
         let Some(path) = real_unigram_fixture() else {
             eprintln!("skipping real tokenizer parity test: no Unigram fixture found");
             return;
         };
 
         let mut yada = Unigram::load(&path).unwrap();
-        let mut legacy = yada.clone();
-        legacy.force_legacy_trie_for_tests();
+        let mut fallback = yada.clone();
+        fallback.force_fallback_trie_for_tests();
+
+        // Guard against the parity check silently degrading into a
+        // fallback-vs-fallback comparison if the fixture ever stops being
+        // yada-eligible: the fast path must actually be exercised.
+        assert!(!yada.trie.is_fallback_for_tests());
+        assert!(fallback.trie.is_fallback_for_tests());
 
         for is_optimized in [true, false] {
             yada.set_optimized(is_optimized);
-            legacy.set_optimized(is_optimized);
+            fallback.set_optimized(is_optimized);
             yada.clear_cache();
-            legacy.clear_cache();
+            fallback.clear_cache();
 
             for text in parity_texts() {
-                assert_eq!(yada.encode(text).unwrap(), legacy.encode(text).unwrap());
+                assert_eq!(yada.encode(text).unwrap(), fallback.encode(text).unwrap());
                 assert_eq!(
                     token_snapshot(yada.tokenize(text).unwrap()),
-                    token_snapshot(legacy.tokenize(text).unwrap())
+                    token_snapshot(fallback.tokenize(text).unwrap())
                 );
             }
         }

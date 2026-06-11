@@ -13,14 +13,14 @@ pub(crate) struct Trie {
 
 enum TrieInner {
     Yada(DoubleArray<Arc<[u8]>>),
-    Legacy(LegacyTrie),
+    Fallback(FallbackTrie),
 }
 
 impl Clone for Trie {
     fn clone(&self) -> Self {
         let inner = match &self.inner {
             TrieInner::Yada(da) => TrieInner::Yada(da.clone()),
-            TrieInner::Legacy(trie) => TrieInner::Legacy(trie.clone()),
+            TrieInner::Fallback(trie) => TrieInner::Fallback(trie.clone()),
         };
         Self { inner }
     }
@@ -32,48 +32,45 @@ impl Trie {
             .map(|(key, value)| (key.to_vec(), value))
             .collect::<Vec<_>>();
 
+        // yada cannot represent these inputs, so fall back to the hash-map trie:
+        // - an empty keyset,
+        // - keys containing a NUL byte (yada uses `0x00` as the leaf terminator),
+        // - values larger than `YADA_MAX_VALUE` (2^31 - 1).
         if raw.is_empty()
             || raw.iter().any(|(key, _)| key.contains(&0))
             || raw.iter().any(|(_, value)| *value > YADA_MAX_VALUE)
         {
-            return Ok(Self::legacy(raw));
+            return Ok(Self::fallback(raw));
         }
 
-        let mut keyset = raw
-            .iter()
-            .filter(|(key, _)| !key.is_empty())
-            .map(|(key, value)| (key.clone(), *value))
-            .collect::<Vec<_>>();
-
-        if keyset.is_empty() {
-            return Ok(Self::legacy(raw));
-        }
-
-        keyset.sort_by(|(left_key, left_value), (right_key, right_value)| {
-            left_key
-                .cmp(right_key)
-                .then_with(|| left_value.cmp(right_value))
-        });
-
-        let mut dedup: Vec<(Vec<u8>, u32)> = Vec::with_capacity(keyset.len());
-        for (key, value) in keyset {
-            if let Some((last_key, last_value)) = dedup.last_mut() {
-                if *last_key == key {
-                    *last_value = (*last_value).max(value);
-                    continue;
-                }
+        // Deduplicate to the unique, bytewise-sorted keyset that
+        // `DoubleArrayBuilder::build` requires. Keep the value of the *last*
+        // occurrence of each key so the fast path matches the fallback trie's
+        // last-write-wins behaviour (which mirrors `token_to_ids` insertion
+        // order in `Unigram`). Empty keys are dropped: yada rejects them.
+        let mut last_value: AHashMap<&[u8], u32> = AHashMap::with_capacity(raw.len());
+        for (key, value) in &raw {
+            if key.is_empty() {
+                continue;
             }
-            dedup.push((key, value));
+            last_value.insert(key.as_slice(), *value);
         }
+
+        if last_value.is_empty() {
+            return Ok(Self::fallback(raw));
+        }
+
+        let mut dedup: Vec<(&[u8], u32)> = last_value.into_iter().collect();
+        dedup.sort_unstable_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
 
         let bytes = match DoubleArrayBuilder::build(&dedup) {
             Ok(bytes) => bytes,
-            Err(_) => return Ok(Self::legacy(raw)),
+            Err(_) => return Ok(Self::fallback(raw)),
         };
         let bytes = Arc::<[u8]>::from(bytes);
         let da = match DoubleArray::new(bytes) {
             Ok(da) => da,
-            Err(_) => return Ok(Self::legacy(raw)),
+            Err(_) => return Ok(Self::fallback(raw)),
         };
 
         Ok(Self {
@@ -89,25 +86,25 @@ impl Trie {
                 unit_id: 0,
                 pos: 0,
             }),
-            TrieInner::Legacy(trie) => SearchIter::Legacy(trie.common_prefix_search(suffix)),
+            TrieInner::Fallback(trie) => SearchIter::Fallback(trie.common_prefix_search(suffix)),
         }
     }
 
-    fn legacy(entries: Vec<(Vec<u8>, u32)>) -> Self {
-        let mut trie = LegacyTrie::default();
+    fn fallback(entries: Vec<(Vec<u8>, u32)>) -> Self {
+        let mut trie = FallbackTrie::default();
         for (key, value) in entries {
             trie.push(&key, value);
         }
         Self {
-            inner: TrieInner::Legacy(trie),
+            inner: TrieInner::Fallback(trie),
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn build_legacy_for_tests<'a>(
+    pub(crate) fn build_fallback_for_tests<'a>(
         entries: impl Iterator<Item = (&'a [u8], u32)>,
     ) -> Self {
-        Self::legacy(
+        Self::fallback(
             entries
                 .map(|(key, value)| (key.to_vec(), value))
                 .collect::<Vec<_>>(),
@@ -115,22 +112,22 @@ impl Trie {
     }
 
     #[cfg(test)]
-    pub(crate) fn is_legacy_for_tests(&self) -> bool {
-        matches!(self.inner, TrieInner::Legacy(_))
+    pub(crate) fn is_fallback_for_tests(&self) -> bool {
+        matches!(self.inner, TrieInner::Fallback(_))
     }
 
     #[cfg(test)]
     pub(crate) fn storage_bytes_for_tests(&self) -> Option<usize> {
         match &self.inner {
             TrieInner::Yada(da) => Some(da.0.len()),
-            TrieInner::Legacy(_) => None,
+            TrieInner::Fallback(_) => None,
         }
     }
 }
 
 pub(crate) enum SearchIter<'a> {
     Yada(YadaIter<'a>),
-    Legacy(LegacyIter<'a>),
+    Fallback(FallbackIter<'a>),
 }
 
 impl Iterator for SearchIter<'_> {
@@ -139,7 +136,7 @@ impl Iterator for SearchIter<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             Self::Yada(iter) => iter.next(),
-            Self::Legacy(iter) => iter.next(),
+            Self::Fallback(iter) => iter.next(),
         }
     }
 }
@@ -157,7 +154,11 @@ impl Iterator for YadaIter<'_> {
     fn next(&mut self) -> Option<Self::Item> {
         while self.pos < self.suffix.len() {
             let unit = get_yada_unit(self.bytes, self.unit_id)?;
-            let byte = *self.suffix.get(self.pos)?;
+            // `self.pos < self.suffix.len()` is guaranteed by the loop, so direct
+            // indexing cannot panic. A NUL byte can never be a valid edge in a
+            // yada trie (it is the leaf terminator), so stop the walk: continuing
+            // would let yada treat it as a terminator and report spurious matches.
+            let byte = self.suffix[self.pos];
             if byte == 0 {
                 return None;
             }
@@ -188,12 +189,16 @@ fn get_yada_unit(bytes: &[u8], index: usize) -> Option<Unit> {
     Some(Unit::from_u32(u32::from_le_bytes(raw)))
 }
 
+/// Hash-map trie used whenever the input cannot be represented by yada's
+/// double-array (empty vocab, keys containing NUL, or values above
+/// `YADA_MAX_VALUE`). This is a permanent, correctness-preserving fallback, not
+/// deprecated code.
 #[derive(Clone, Default)]
-struct LegacyTrie {
-    root: LegacyNode,
+struct FallbackTrie {
+    root: FallbackNode,
 }
 
-impl LegacyTrie {
+impl FallbackTrie {
     fn push(&mut self, key: &[u8], value: u32) {
         let mut node = &mut self.root;
         for byte in key {
@@ -202,8 +207,8 @@ impl LegacyTrie {
         node.value = Some(value);
     }
 
-    fn common_prefix_search<'a>(&'a self, suffix: &'a [u8]) -> LegacyIter<'a> {
-        LegacyIter {
+    fn common_prefix_search<'a>(&'a self, suffix: &'a [u8]) -> FallbackIter<'a> {
+        FallbackIter {
             node: Some(&self.root),
             suffix,
             pos: 0,
@@ -212,18 +217,18 @@ impl LegacyTrie {
 }
 
 #[derive(Clone, Default)]
-struct LegacyNode {
+struct FallbackNode {
     value: Option<u32>,
-    children: AHashMap<u8, LegacyNode>,
+    children: AHashMap<u8, FallbackNode>,
 }
 
-pub(crate) struct LegacyIter<'a> {
-    node: Option<&'a LegacyNode>,
+pub(crate) struct FallbackIter<'a> {
+    node: Option<&'a FallbackNode>,
     suffix: &'a [u8],
     pos: usize,
 }
 
-impl Iterator for LegacyIter<'_> {
+impl Iterator for FallbackIter<'_> {
     type Item = (u32, usize);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -261,19 +266,43 @@ mod tests {
 
     #[test]
     fn last_wins_dedup() {
-        let trie = build(&[(b"a", 1), (b"a", 7), (b"ab", 2)]);
+        // The value decreases across duplicates, so this distinguishes
+        // last-write-wins from a max-wins policy: the last occurrence (1) must
+        // win in both the yada fast path and the hash-map fallback.
+        let entries: &[(&[u8], u32)] = &[(b"a", 7), (b"a", 1), (b"ab", 2)];
 
+        let yada = build(entries);
+        assert!(!yada.is_fallback_for_tests());
         assert_eq!(
-            trie.common_prefix_search(b"ab").collect::<Vec<_>>(),
-            vec![(7, 1), (2, 2)]
+            yada.common_prefix_search(b"ab").collect::<Vec<_>>(),
+            vec![(1, 1), (2, 2)]
+        );
+
+        let fallback =
+            Trie::build_fallback_for_tests(entries.iter().map(|(key, value)| (*key, *value)));
+        assert!(fallback.is_fallback_for_tests());
+        assert_eq!(
+            fallback.common_prefix_search(b"ab").collect::<Vec<_>>(),
+            vec![(1, 1), (2, 2)]
         );
     }
 
     #[test]
-    fn empty_vocab_uses_legacy_and_matches_nothing() {
+    fn large_value_uses_fallback() {
+        let trie = build(&[(b"a", YADA_MAX_VALUE + 1)]);
+
+        assert!(trie.is_fallback_for_tests());
+        assert_eq!(
+            trie.common_prefix_search(b"a").collect::<Vec<_>>(),
+            vec![(YADA_MAX_VALUE + 1, 1)]
+        );
+    }
+
+    #[test]
+    fn empty_vocab_uses_fallback_and_matches_nothing() {
         let trie = Trie::build(std::iter::empty()).unwrap();
 
-        assert!(trie.is_legacy_for_tests());
+        assert!(trie.is_fallback_for_tests());
         assert_eq!(trie.common_prefix_search(b"a").collect::<Vec<_>>(), vec![]);
     }
 
@@ -301,7 +330,7 @@ mod tests {
     fn nul_input_does_not_match_across_nul() {
         let trie = build(&[(b"ab", 2)]);
 
-        assert!(!trie.is_legacy_for_tests());
+        assert!(!trie.is_fallback_for_tests());
         assert_eq!(
             trie.common_prefix_search(b"a\0b").collect::<Vec<_>>(),
             vec![]
@@ -313,7 +342,7 @@ mod tests {
 
         let trie = build(&[(b"ab", 1), (b"abc", 2), (b"x", 3), (b"xyz", 4)]);
 
-        assert!(!trie.is_legacy_for_tests());
+        assert!(!trie.is_fallback_for_tests());
         assert_eq!(
             trie.common_prefix_search(b"ab\0c").collect::<Vec<_>>(),
             vec![(1, 2)]
@@ -325,10 +354,10 @@ mod tests {
     }
 
     #[test]
-    fn nul_key_uses_legacy_and_matches_byte_exact() {
+    fn nul_key_uses_fallback_and_matches_byte_exact() {
         let trie = build(&[(b"a", 1), (b"a\0b", 2)]);
 
-        assert!(trie.is_legacy_for_tests());
+        assert!(trie.is_fallback_for_tests());
         assert_eq!(
             trie.common_prefix_search(b"a\0b").collect::<Vec<_>>(),
             vec![(1, 1), (2, 3)]
