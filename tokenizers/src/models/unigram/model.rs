@@ -1,8 +1,4 @@
-use super::{
-    lattice::Lattice,
-    trainer::UnigramTrainer,
-    trie::{Trie, TrieBuilder},
-};
+use super::{lattice::Lattice, trainer::UnigramTrainer, trie::Trie};
 use crate::tokenizer::{Model, Result, Token};
 use crate::utils::cache::{Cache, MAX_LENGTH};
 use std::collections::HashMap;
@@ -20,7 +16,7 @@ pub struct Unigram {
     token_to_ids: TokenMap,
     pub(crate) vocab: Vocab,
     cache: Cache<String, Vec<String>>,
-    trie: Trie<u8>,
+    trie: Trie,
     pub min_score: f64,
     pub(super) unk_id: Option<usize>,
     pub(super) bos_id: usize,
@@ -108,7 +104,6 @@ impl Unigram {
     ) -> Result<Self> {
         let n = vocab.len();
         let mut token_to_ids: TokenMap = AHashMap::new();
-        let mut builder = TrieBuilder::default();
 
         if let Some(unk_id) = unk_id {
             if vocab.is_empty() {
@@ -124,12 +119,16 @@ impl Unigram {
         let mut min_score = f64::INFINITY;
         for (id, (token, score)) in vocab.iter().enumerate() {
             token_to_ids.insert(token.to_string(), id as u32);
-            builder.push(token.as_bytes());
             if score < &min_score {
                 min_score = *score;
             }
         }
-        let trie = builder.build();
+        let trie = Trie::build(
+            vocab
+                .iter()
+                .enumerate()
+                .map(|(id, (token, _))| (token.as_bytes(), id as u32)),
+        )?;
         let fuse_unk = true;
         let is_optimized = true;
 
@@ -160,6 +159,19 @@ impl Unigram {
     pub(super) fn set_optimized(&mut self, is_optimized: bool) {
         self.is_optimized = is_optimized;
     }
+
+    #[cfg(test)]
+    fn force_fallback_trie_for_tests(&mut self) {
+        let trie = Trie::build_fallback_for_tests(
+            self.vocab
+                .iter()
+                .enumerate()
+                .map(|(id, (token, _))| (token.as_bytes(), id as u32)),
+        );
+        self.trie = trie;
+        self.clear_cache();
+    }
+
     pub fn byte_fallback(&self) -> bool {
         self.byte_fallback
     }
@@ -182,16 +194,11 @@ impl Unigram {
 
             let mut has_single_node = false;
 
-            for bytes in self
+            for (id, n) in self
                 .trie
-                .common_prefix_search(lattice.sentence.bytes().skip(begin_pos))
+                .common_prefix_search(&lattice.sentence.as_bytes()[begin_pos..])
             {
-                let n = bytes.len();
-                let tok = String::from_utf8(bytes).unwrap();
-                let id = *self.token_to_ids.get(&tok).unwrap();
-
                 let item = &self.vocab[id as usize];
-                assert_eq!(item.0, tok);
                 let score: f64 = item.1;
                 lattice.insert(begin_pos, n, score, id.try_into().unwrap());
                 if !has_single_node && n == mblen {
@@ -282,23 +289,20 @@ impl Unigram {
             let best_path_score_till_here = best_path_ends_at[starts_at].best_path_score;
             let mut has_single_node = false;
             let mblen = sentence[starts_at..].chars().next().unwrap().len_utf8();
-            for tok_bytes in self
+            for (id, length) in self
                 .trie
-                .common_prefix_search(sentence.bytes().skip(starts_at))
+                .common_prefix_search(&sentence.as_bytes()[starts_at..])
             {
-                let key_pos = starts_at + tok_bytes.len();
-                let token: String = String::from_utf8(tok_bytes).unwrap();
+                let key_pos = starts_at + length;
                 let target_node = &mut best_path_ends_at[key_pos];
-                let length = key_pos - starts_at;
-                let id = self.token_to_ids.get(&token).unwrap();
-                let score = self.vocab.get(*id as usize).unwrap().1;
+                let score = self.vocab.get(id as usize).unwrap().1;
                 let candidate_best_path_score = score + best_path_score_till_here;
                 if target_node.starts_at.is_none()
                     || candidate_best_path_score > target_node.best_path_score
                 {
                     target_node.best_path_score = candidate_best_path_score;
                     target_node.starts_at = Some(starts_at);
-                    target_node.id = *id as usize;
+                    target_node.id = id as usize;
                 }
                 if !has_single_node && length == mblen {
                     has_single_node = true;
@@ -660,5 +664,133 @@ mod tests {
 
         let tokens = unigram.tokenize("?é").unwrap();
         assert_eq!(tokens[0].id, 0);
+    }
+
+    fn token_snapshot(tokens: Vec<Token>) -> Vec<(u32, String, (usize, usize))> {
+        tokens
+            .into_iter()
+            .map(|token| (token.id, token.value, token.offsets))
+            .collect()
+    }
+
+    fn real_unigram_fixture() -> Option<PathBuf> {
+        [
+            "data/unigram.json",
+            "data/albert-base-v1-tokenizer.json",
+            "tokenizers/data/unigram.json",
+            "tokenizers/data/albert-base-v1-tokenizer.json",
+        ]
+        .iter()
+        .map(|path| PathBuf::from(*path))
+        .find(|path| path.exists())
+    }
+
+    fn parity_texts() -> [&'static str; 4] {
+        [
+            "abcdacdxx",
+            "吾輩《わがはい》は猫である。名前はまだ無い。",
+            "한국어 العربية 😀 mixed text",
+            "control\0char",
+        ]
+    }
+
+    fn synthetic_model() -> Unigram {
+        Unigram::from(
+            vec![
+                ("<unk>".to_string(), 0.0),
+                ("a".to_string(), 0.0),
+                ("b".to_string(), 0.0),
+                ("ab".to_string(), 2.0),
+                ("한국".to_string(), 1.0),
+                ("😀".to_string(), 1.0),
+            ],
+            Some(0),
+            false,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn yada_matches_fallback_on_real_tokenizer() {
+        let Some(path) = real_unigram_fixture() else {
+            eprintln!("skipping real tokenizer parity test: no Unigram fixture found");
+            return;
+        };
+
+        let mut yada = Unigram::load(&path).unwrap();
+        let mut fallback = yada.clone();
+        fallback.force_fallback_trie_for_tests();
+
+        // Guard against the parity check silently degrading into a
+        // fallback-vs-fallback comparison if the fixture ever stops being
+        // yada-eligible: the fast path must actually be exercised.
+        assert!(!yada.trie.is_fallback_for_tests());
+        assert!(fallback.trie.is_fallback_for_tests());
+
+        for is_optimized in [true, false] {
+            yada.set_optimized(is_optimized);
+            fallback.set_optimized(is_optimized);
+            yada.clear_cache();
+            fallback.clear_cache();
+
+            for text in parity_texts() {
+                assert_eq!(yada.encode(text).unwrap(), fallback.encode(text).unwrap());
+                assert_eq!(
+                    token_snapshot(yada.tokenize(text).unwrap()),
+                    token_snapshot(fallback.tokenize(text).unwrap())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn clone_preserves_trie_behavior() {
+        let model = synthetic_model();
+        let cloned = model.clone();
+
+        assert_eq!(
+            model.encode("ab한국😀x").unwrap(),
+            cloned.encode("ab한국😀x").unwrap()
+        );
+        assert_eq!(
+            token_snapshot(model.tokenize("ab한국😀x").unwrap()),
+            token_snapshot(cloned.tokenize("ab한국😀x").unwrap())
+        );
+        assert_eq!(
+            model.trie.storage_bytes_for_tests(),
+            cloned.trie.storage_bytes_for_tests()
+        );
+    }
+
+    #[test]
+    fn serde_roundtrip_rebuilds_trie_identically() {
+        let model = synthetic_model();
+        let data = serde_json::to_string(&model).unwrap();
+        let reconstructed: Unigram = serde_json::from_str(&data).unwrap();
+
+        assert_eq!(
+            model.encode("ab한국😀x").unwrap(),
+            reconstructed.encode("ab한국😀x").unwrap()
+        );
+        assert_eq!(
+            token_snapshot(model.tokenize("ab한국😀x").unwrap()),
+            token_snapshot(reconstructed.tokenize("ab한국😀x").unwrap())
+        );
+    }
+
+    #[ignore]
+    #[test]
+    fn report_unigram_trie_storage() {
+        let Some(path) = real_unigram_fixture() else {
+            eprintln!("skipping trie storage report: no Unigram fixture found");
+            return;
+        };
+        let model = Unigram::load(&path).unwrap();
+        eprintln!(
+            "fixture={:?} vocab={} yada_storage_bytes={:?}",
+            path,
+            model.vocab.len(),
+            model.trie.storage_bytes_for_tests()
+        );
     }
 }
