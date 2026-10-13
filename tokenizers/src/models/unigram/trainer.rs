@@ -120,7 +120,10 @@ impl UnigramTrainer {
         // We don't want to include the <UNK> that was used to train
         inserted.insert("<UNK>".into());
 
-        let existing_pieces: AHashMap<String, f64> = model.iter().cloned().collect();
+        let existing_pieces: AHashMap<String, f64> = model
+            .iter()
+            .map(|(token, score)| (token.to_owned(), score))
+            .collect();
         for c in required_chars {
             if let Some(t) = existing_pieces.get(&c) {
                 inserted.insert(c.clone());
@@ -160,7 +163,7 @@ impl UnigramTrainer {
                 continue;
             }
             inserted.insert(token.to_string());
-            pieces.push((token.to_string(), if score.is_nan() { 0.0 } else { *score }));
+            pieces.push((token.to_string(), if score.is_nan() { 0.0 } else { score }));
 
             if pieces.len() == vocab_size_without_special_tokens {
                 break;
@@ -750,9 +753,9 @@ mod tests {
             .unwrap();
 
         let mut pieces = unigram.iter();
-        assert_eq!(pieces.next(), Some(&("[UNK]".into(), 0.0)));
-        assert_eq!(pieces.next(), Some(&("[SEP]".into(), 0.0)));
-        assert_eq!(pieces.next(), Some(&("[CLS]".into(), 0.0)));
+        assert_eq!(pieces.next(), Some(("[UNK]", 0.0)));
+        assert_eq!(pieces.next(), Some(("[SEP]", 0.0)));
+        assert_eq!(pieces.next(), Some(("[CLS]", 0.0)));
 
         // 2. Let it where it is
         let trainer = UnigramTrainerBuilder::default()
@@ -772,9 +775,9 @@ mod tests {
             .unwrap();
 
         let mut pieces = unigram.iter();
-        assert_eq!(pieces.next(), Some(&("[SEP]".into(), 0.0)));
-        assert_eq!(pieces.next(), Some(&("[CLS]".into(), 0.0)));
-        assert_eq!(pieces.next(), Some(&("[UNK]".into(), 0.0)));
+        assert_eq!(pieces.next(), Some(("[SEP]", 0.0)));
+        assert_eq!(pieces.next(), Some(("[CLS]", 0.0)));
+        assert_eq!(pieces.next(), Some(("[UNK]", 0.0)));
 
         // 3. Don't put it there if not needed
         let trainer = UnigramTrainerBuilder::default()
@@ -788,7 +791,7 @@ mod tests {
             .unwrap();
 
         let mut pieces = unigram.iter();
-        assert_eq!(pieces.next().unwrap().0, "e".to_string());
+        assert_eq!(pieces.next().unwrap().0, "e");
     }
 
     #[test]
@@ -808,8 +811,8 @@ mod tests {
             .unwrap();
 
         let mut pieces = unigram.iter();
-        assert_eq!(pieces.next(), Some(&("[SEP]".into(), 0.0)));
-        assert_eq!(pieces.next(), Some(&("[CLS]".into(), 0.0)));
+        assert_eq!(pieces.next(), Some(("[SEP]", 0.0)));
+        assert_eq!(pieces.next(), Some(("[CLS]", 0.0)));
     }
 
     #[test]

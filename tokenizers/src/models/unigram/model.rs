@@ -3,11 +3,67 @@ use crate::tokenizer::{Model, Result, Token};
 use crate::utils::cache::{Cache, MAX_LENGTH};
 use std::collections::HashMap;
 
-use std::convert::TryInto;
+use std::convert::{TryFrom, TryInto};
 use std::fs::read_to_string;
 use std::path::{Path, PathBuf};
 
-type Vocab = Vec<(String, f64)>;
+/// Tokens and scores of a `Unigram` vocabulary, indexed by id.
+///
+/// Tokens are concatenated into one buffer instead of one `String` each: a
+/// 250k-token vocabulary would otherwise cost 250k heap blocks plus 24 bytes
+/// of `String` header per token.
+#[derive(Clone, Default, PartialEq)]
+pub(crate) struct Vocab {
+    text: String,
+    /// End offset of each token in `text`; a token starts where the previous
+    /// one ends.
+    ends: Vec<u32>,
+    scores: Vec<f64>,
+}
+
+impl Vocab {
+    fn new(pieces: Vec<(String, f64)>) -> Result<Self> {
+        let text_len: usize = pieces.iter().map(|(token, _)| token.len()).sum();
+        if u32::try_from(text_len).is_err() {
+            return Err(Box::new(UnigramError::VocabularyTooLarge));
+        }
+        let mut vocab = Self {
+            text: String::with_capacity(text_len),
+            ends: Vec::with_capacity(pieces.len()),
+            scores: Vec::with_capacity(pieces.len()),
+        };
+        for (token, score) in pieces {
+            vocab.text.push_str(&token);
+            vocab.ends.push(vocab.text.len() as u32);
+            vocab.scores.push(score);
+        }
+        Ok(vocab)
+    }
+
+    fn len(&self) -> usize {
+        self.scores.len()
+    }
+
+    fn token(&self, id: usize) -> &str {
+        let start = match id {
+            0 => 0,
+            _ => self.ends[id - 1] as usize,
+        };
+        &self.text[start..self.ends[id] as usize]
+    }
+
+    fn score(&self, id: usize) -> f64 {
+        self.scores[id]
+    }
+
+    fn get(&self, id: usize) -> Option<(&str, f64)> {
+        (id < self.len()).then(|| (self.token(id), self.score(id)))
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&str, f64)> {
+        (0..self.len()).map(move |id| (self.token(id), self.score(id)))
+    }
+}
 
 /// A `Unigram` model to encode sentences.
 pub struct Unigram {
@@ -77,6 +133,8 @@ pub enum UnigramError {
     UnkIdNotInVocabulary,
     #[error("Encountered an unknown token but `unk_id` is missing")]
     MissingUnkId,
+    #[error("The vocabulary tokens exceed 4 GiB in total")]
+    VocabularyTooLarge,
 }
 
 impl Default for Unigram {
@@ -111,10 +169,8 @@ impl Unigram {
         let bos_id = n + 1;
         let eos_id = n + 2;
 
-        let min_score = vocab
-            .iter()
-            .map(|(_, score)| *score)
-            .fold(f64::INFINITY, f64::min);
+        let vocab = Vocab::new(vocab)?;
+        let min_score = vocab.scores.iter().copied().fold(f64::INFINITY, f64::min);
         // The trie doubles as the token -> id map, so the tokens are not
         // stored a second time in a hash map.
         let trie = Trie::build(
@@ -191,8 +247,7 @@ impl Unigram {
                 .trie
                 .common_prefix_search(&lattice.sentence.as_bytes()[begin_pos..])
             {
-                let item = &self.vocab[id as usize];
-                let score: f64 = item.1;
+                let score = self.vocab.score(id as usize);
                 lattice.insert(begin_pos, n, score, id.try_into().unwrap());
                 if !has_single_node && n == mblen {
                     has_single_node = true;
@@ -288,7 +343,7 @@ impl Unigram {
             {
                 let key_pos = starts_at + length;
                 let target_node = &mut best_path_ends_at[key_pos];
-                let score = self.vocab.get(id as usize).unwrap().1;
+                let score = self.vocab.score(id as usize);
                 let candidate_best_path_score = score + best_path_score_till_here;
                 if target_node.starts_at.is_none()
                     || candidate_best_path_score > target_node.best_path_score
@@ -412,17 +467,12 @@ pub struct UnigramIterator<'a> {
 }
 
 impl<'a> Iterator for UnigramIterator<'a> {
-    type Item = &'a (String, f64);
+    type Item = (&'a str, f64);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let i = self.i;
-        if i < self.model.len() {
-            let r = Some(&self.model.vocab[i]);
-            self.i += 1;
-            r
-        } else {
-            None
-        }
+        let item = self.model.vocab.get(self.i)?;
+        self.i += 1;
+        Some(item)
     }
 }
 
@@ -434,7 +484,7 @@ impl Model for Unigram {
         self.vocab
             .iter()
             .enumerate()
-            .map(|(id, (token, _))| (token.clone(), id as u32))
+            .map(|(id, (token, _))| (token.to_owned(), id as u32))
             .collect()
     }
 
@@ -483,7 +533,9 @@ impl Model for Unigram {
     }
 
     fn id_to_token(&self, id: u32) -> Option<String> {
-        self.vocab.get(id as usize).map(|item| item.0.clone())
+        self.vocab
+            .get(id as usize)
+            .map(|(token, _)| token.to_owned())
     }
 
     fn save(&self, folder: &Path, name: Option<&str>) -> Result<Vec<PathBuf>> {
@@ -518,8 +570,15 @@ mod tests {
             ("a".to_string(), -4.0),
             ("ab".to_string(), -5.0),
         ];
-        let model = Unigram::from(pieces, Some(0), false).unwrap();
+        let model = Unigram::from(pieces.clone(), Some(0), false).unwrap();
 
+        assert_eq!(
+            model.iter().collect::<Vec<_>>(),
+            pieces
+                .iter()
+                .map(|(token, score)| (token.as_str(), *score))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(model.id_to_token(1).as_deref(), Some(""));
         assert_eq!(model.id_to_token(5).as_deref(), Some("ab"));
         assert_eq!(model.id_to_token(6), None);

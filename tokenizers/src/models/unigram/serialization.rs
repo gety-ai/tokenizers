@@ -1,4 +1,4 @@
-use super::model::Unigram;
+use super::model::{Unigram, Vocab};
 use serde::{
     de::{Error, MapAccess, Visitor},
     ser::SerializeStruct,
@@ -18,6 +18,15 @@ impl Serialize for Unigram {
         model.serialize_field("byte_fallback", &self.byte_fallback())?;
 
         model.end()
+    }
+}
+
+impl Serialize for Vocab {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_seq(self.iter())
     }
 }
 
