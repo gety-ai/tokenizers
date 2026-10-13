@@ -3,17 +3,14 @@ use crate::tokenizer::{Model, Result, Token};
 use crate::utils::cache::{Cache, MAX_LENGTH};
 use std::collections::HashMap;
 
-use ahash::AHashMap;
 use std::convert::TryInto;
 use std::fs::read_to_string;
 use std::path::{Path, PathBuf};
 
-type TokenMap = AHashMap<String, u32>;
 type Vocab = Vec<(String, f64)>;
 
 /// A `Unigram` model to encode sentences.
 pub struct Unigram {
-    token_to_ids: TokenMap,
     pub(crate) vocab: Vocab,
     cache: Cache<String, Vec<String>>,
     trie: Trie,
@@ -46,7 +43,6 @@ impl Clone for Unigram {
         Self {
             vocab: self.vocab.clone(),
             cache: fresh_cache,
-            token_to_ids: self.token_to_ids.clone(),
             trie: self.trie.clone(),
             min_score: self.min_score,
             unk_id: self.unk_id,
@@ -103,7 +99,6 @@ impl Unigram {
         byte_fallback: bool,
     ) -> Result<Self> {
         let n = vocab.len();
-        let mut token_to_ids: TokenMap = AHashMap::new();
 
         if let Some(unk_id) = unk_id {
             if vocab.is_empty() {
@@ -116,13 +111,12 @@ impl Unigram {
         let bos_id = n + 1;
         let eos_id = n + 2;
 
-        let mut min_score = f64::INFINITY;
-        for (id, (token, score)) in vocab.iter().enumerate() {
-            token_to_ids.insert(token.to_string(), id as u32);
-            if score < &min_score {
-                min_score = *score;
-            }
-        }
+        let min_score = vocab
+            .iter()
+            .map(|(_, score)| *score)
+            .fold(f64::INFINITY, f64::min);
+        // The trie doubles as the token -> id map, so the tokens are not
+        // stored a second time in a hash map.
         let trie = Trie::build(
             vocab
                 .iter()
@@ -134,7 +128,6 @@ impl Unigram {
 
         Ok(Self {
             vocab,
-            token_to_ids,
             trie,
             min_score,
             bos_id,
@@ -437,7 +430,12 @@ impl Model for Unigram {
     type Trainer = UnigramTrainer;
 
     fn get_vocab(&self) -> HashMap<String, u32> {
-        self.token_to_ids.clone().into_iter().collect()
+        // Later duplicates overwrite earlier ones, matching `token_to_id`.
+        self.vocab
+            .iter()
+            .enumerate()
+            .map(|(id, (token, _))| (token.clone(), id as u32))
+            .collect()
     }
 
     fn get_vocab_size(&self) -> usize {
@@ -451,16 +449,16 @@ impl Model for Unigram {
         for string in str_tokens {
             let len = string.len();
             let offsets = (offset, offset + len);
-            let id: u32 = match self.token_to_ids.get(&string) {
-                Some(id) => *id,
+            let id: u32 = match self.token_to_id(&string) {
+                Some(id) => id,
                 None => {
                     if self.byte_fallback {
                         let byte_tokens: Option<Vec<_>> = string
                             .bytes()
                             .map(|byte| -> Option<Token> {
                                 let byte_string = format!("<0x{byte:02X}>");
-                                let id = self.token_to_ids.get(&byte_string);
-                                id.map(|id| Token::new(*id, byte_string, (offset, offset + len)))
+                                let id = self.token_to_id(&byte_string);
+                                id.map(|id| Token::new(id, byte_string, (offset, offset + len)))
                             })
                             .collect();
                         if let Some(byte_tokens) = byte_tokens {
@@ -481,7 +479,7 @@ impl Model for Unigram {
     }
 
     fn token_to_id(&self, token: &str) -> Option<u32> {
-        self.token_to_ids.get(token).copied()
+        self.trie.exact_match(token.as_bytes())
     }
 
     fn id_to_token(&self, id: u32) -> Option<String> {
@@ -509,6 +507,32 @@ impl Model for Unigram {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vocab_lookups_handle_empty_and_duplicate_tokens() {
+        let pieces = vec![
+            ("<unk>".to_string(), 0.0),
+            ("".to_string(), -1.0),
+            ("a".to_string(), -2.0),
+            ("".to_string(), -3.0),
+            ("a".to_string(), -4.0),
+            ("ab".to_string(), -5.0),
+        ];
+        let model = Unigram::from(pieces, Some(0), false).unwrap();
+
+        assert_eq!(model.id_to_token(1).as_deref(), Some(""));
+        assert_eq!(model.id_to_token(5).as_deref(), Some("ab"));
+        assert_eq!(model.id_to_token(6), None);
+        // Duplicates resolve to their last occurrence.
+        assert_eq!(model.token_to_id(""), Some(3));
+        assert_eq!(model.token_to_id("a"), Some(4));
+        assert_eq!(model.token_to_id("b"), None);
+        let vocab = model.get_vocab();
+        assert_eq!(vocab.len(), 4);
+        assert_eq!(vocab[""], 3);
+        assert_eq!(vocab["a"], 4);
+        assert_eq!(model.get_vocab_size(), 6);
+    }
 
     #[test]
     fn test_populate_nodes_unk() {

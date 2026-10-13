@@ -12,14 +12,22 @@ pub(crate) struct Trie {
 }
 
 enum TrieInner {
-    Yada(DoubleArray<Arc<[u8]>>),
+    Yada {
+        da: DoubleArray<Arc<[u8]>>,
+        /// yada cannot store the empty key, so its value is kept aside to make
+        /// `exact_match` agree with the fallback trie.
+        empty_value: Option<u32>,
+    },
     Fallback(FallbackTrie),
 }
 
 impl Clone for Trie {
     fn clone(&self) -> Self {
         let inner = match &self.inner {
-            TrieInner::Yada(da) => TrieInner::Yada(da.clone()),
+            TrieInner::Yada { da, empty_value } => TrieInner::Yada {
+                da: da.clone(),
+                empty_value: *empty_value,
+            },
             TrieInner::Fallback(trie) => TrieInner::Fallback(trie.clone()),
         };
         Self { inner }
@@ -49,8 +57,10 @@ impl Trie {
         // last-write-wins behaviour (which mirrors `token_to_ids` insertion
         // order in `Unigram`). Empty keys are dropped: yada rejects them.
         let mut last_value: AHashMap<&[u8], u32> = AHashMap::with_capacity(raw.len());
+        let mut empty_value = None;
         for (key, value) in &raw {
             if key.is_empty() {
+                empty_value = Some(*value);
                 continue;
             }
             last_value.insert(key.as_slice(), *value);
@@ -74,13 +84,27 @@ impl Trie {
         };
 
         Ok(Self {
-            inner: TrieInner::Yada(da),
+            inner: TrieInner::Yada { da, empty_value },
         })
+    }
+
+    /// Returns the value of `key` itself, with the same last-write-wins
+    /// semantics as `common_prefix_search`, including for the empty key.
+    pub(crate) fn exact_match(&self, key: &[u8]) -> Option<u32> {
+        match &self.inner {
+            TrieInner::Yada { da, empty_value } => {
+                if key.is_empty() {
+                    return *empty_value;
+                }
+                yada_exact_match(&da.0, key)
+            }
+            TrieInner::Fallback(trie) => trie.exact_match(key),
+        }
     }
 
     pub(crate) fn common_prefix_search<'a>(&'a self, suffix: &'a [u8]) -> SearchIter<'a> {
         match &self.inner {
-            TrieInner::Yada(da) => SearchIter::Yada(YadaIter {
+            TrieInner::Yada { da, .. } => SearchIter::Yada(YadaIter {
                 bytes: &da.0,
                 suffix,
                 unit_id: 0,
@@ -119,7 +143,7 @@ impl Trie {
     #[cfg(test)]
     pub(crate) fn storage_bytes_for_tests(&self) -> Option<usize> {
         match &self.inner {
-            TrieInner::Yada(da) => Some(da.0.len()),
+            TrieInner::Yada { da, .. } => Some(da.0.len()),
             TrieInner::Fallback(_) => None,
         }
     }
@@ -182,6 +206,28 @@ impl Iterator for YadaIter<'_> {
     }
 }
 
+/// Non-panicking counterpart of `DoubleArray::exact_match_search`, which
+/// asserts on NUL bytes. No yada key contains NUL, so such a key never matches.
+fn yada_exact_match(bytes: &[u8], key: &[u8]) -> Option<u32> {
+    let mut unit_id = 0;
+    let mut unit = get_yada_unit(bytes, unit_id)?;
+    for &byte in key {
+        if byte == 0 {
+            return None;
+        }
+        unit_id = (unit.offset() ^ unit_id as u32 ^ byte as u32) as usize;
+        unit = get_yada_unit(bytes, unit_id)?;
+        if unit.label() != byte as u32 {
+            return None;
+        }
+    }
+    if !unit.has_leaf() {
+        return None;
+    }
+    let leaf_unit = get_yada_unit(bytes, (unit.offset() ^ unit_id as u32) as usize)?;
+    leaf_unit.is_leaf().then(|| leaf_unit.value())
+}
+
 fn get_yada_unit(bytes: &[u8], index: usize) -> Option<Unit> {
     let start = index.checked_mul(UNIT_SIZE)?;
     let end = start.checked_add(UNIT_SIZE)?;
@@ -205,6 +251,14 @@ impl FallbackTrie {
             node = node.children.entry(*byte).or_default();
         }
         node.value = Some(value);
+    }
+
+    fn exact_match(&self, key: &[u8]) -> Option<u32> {
+        let mut node = &self.root;
+        for byte in key {
+            node = node.children.get(byte)?;
+        }
+        node.value
     }
 
     fn common_prefix_search<'a>(&'a self, suffix: &'a [u8]) -> FallbackIter<'a> {
@@ -351,6 +405,51 @@ mod tests {
             trie.common_prefix_search(b"x\0yz").collect::<Vec<_>>(),
             vec![(3, 1)]
         );
+    }
+
+    #[test]
+    fn exact_match_agrees_between_yada_and_fallback() {
+        let entries: &[(&[u8], u32)] = &[
+            (b"", 4),
+            (b"a", 7),
+            (b"ab", 2),
+            (b"a", 1),
+            (b"", 5),
+            (b"abc", 3),
+        ];
+        let yada = build(entries);
+        assert!(!yada.is_fallback_for_tests());
+        let fallback =
+            Trie::build_fallback_for_tests(entries.iter().map(|(key, value)| (*key, *value)));
+
+        for trie in [&yada, &fallback] {
+            assert_eq!(trie.exact_match(b""), Some(5));
+            assert_eq!(trie.exact_match(b"a"), Some(1));
+            assert_eq!(trie.exact_match(b"ab"), Some(2));
+            assert_eq!(trie.exact_match(b"abc"), Some(3));
+            assert_eq!(trie.exact_match(b"abcd"), None);
+            assert_eq!(trie.exact_match(b"b"), None);
+            assert_eq!(trie.exact_match(b"a "), None);
+            assert_eq!(trie.exact_match(b" "), None);
+        }
+    }
+
+    #[test]
+    fn exact_match_without_empty_key() {
+        let trie = build(&[(b"a", 1)]);
+
+        assert!(!trie.is_fallback_for_tests());
+        assert_eq!(trie.exact_match(b""), None);
+        assert_eq!(trie.exact_match(b"a"), Some(1));
+    }
+
+    #[test]
+    fn exact_match_nul_key_in_fallback() {
+        let trie = build(&[(b"a", 1), (b"a b", 2)]);
+
+        assert!(trie.is_fallback_for_tests());
+        assert_eq!(trie.exact_match(b"a b"), Some(2));
+        assert_eq!(trie.exact_match(b"a "), None);
     }
 
     #[test]
