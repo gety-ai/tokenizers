@@ -450,7 +450,10 @@ impl Unigram {
     }
 
     /// Clears the internal cache
-    pub fn clear_cache(&mut self) {
+    ///
+    /// The cache synchronizes internally, so a shared tokenizer can drop its
+    /// cached encodings without exclusive access.
+    pub fn clear_cache(&self) {
         self.cache.clear();
     }
 

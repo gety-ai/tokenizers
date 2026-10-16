@@ -208,7 +208,7 @@ impl Model for ModelWrapper {
 }
 
 impl ModelWrapper {
-    pub fn clear_cache(&mut self) {
+    pub fn clear_cache(&self) {
         match self {
             Self::Unigram(model) => model.clear_cache(),
             Self::BPE(model) => model.clear_cache(),
